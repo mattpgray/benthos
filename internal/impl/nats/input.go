@@ -58,7 +58,7 @@ You can access these metadata fields using [function interpolation](/docs/config
 			Default(nats.DefaultSubPendingMsgsLimit).
 			LintRule(`root = if this < 0 { ["prefetch count must be greater than or equal to zero"] }`)).
 		Field(service.NewTLSToggledField("tls")).
-		Field(service.NewInternalField(span.ExtractTracingSpanMappingDocs)).
+		Field(service.NewInternalField(span.ExtractTracingSpanMappingDocs).Optional().Default("")).
 		Field(service.NewInternalField(auth.FieldSpec()))
 }
 
