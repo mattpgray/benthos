@@ -9,8 +9,13 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
+	"github.com/benthosdev/benthos/v4/internal/component/input/span"
 	"github.com/benthosdev/benthos/v4/internal/impl/nats/auth"
+	"github.com/benthosdev/benthos/v4/public/bloblang"
 	"github.com/benthosdev/benthos/v4/public/service"
 )
 
@@ -53,6 +58,7 @@ You can access these metadata fields using [function interpolation](/docs/config
 			Default(nats.DefaultSubPendingMsgsLimit).
 			LintRule(`root = if this < 0 { ["prefetch count must be greater than or equal to zero"] }`)).
 		Field(service.NewTLSToggledField("tls")).
+		Field(service.NewInternalField(span.ExtractTracingSpanMappingDocs)).
 		Field(service.NewInternalField(auth.FieldSpec()))
 }
 
@@ -78,9 +84,11 @@ type natsReader struct {
 	nakDelay      time.Duration
 	authConf      auth.Config
 	tlsConf       *tls.Config
+	traceMapping  *bloblang.Executor
 
-	log *service.Logger
-	fs  *service.FS
+	log            *service.Logger
+	fs             *service.FS
+	tracerProvider trace.TracerProvider
 
 	cMut sync.Mutex
 
@@ -93,10 +101,11 @@ type natsReader struct {
 
 func newNATSReader(conf *service.ParsedConfig, mgr *service.Resources) (*natsReader, error) {
 	n := natsReader{
-		label:         mgr.Label(),
-		log:           mgr.Logger(),
-		fs:            mgr.FS(),
-		interruptChan: make(chan struct{}),
+		label:          mgr.Label(),
+		log:            mgr.Logger(),
+		tracerProvider: mgr.OtelTracer(),
+		fs:             mgr.FS(),
+		interruptChan:  make(chan struct{}),
 	}
 
 	urlList, err := conf.FieldStringList("urls")
@@ -139,6 +148,17 @@ func newNATSReader(conf *service.ParsedConfig, mgr *service.Resources) (*natsRea
 
 	if n.authConf, err = AuthFromParsedConfig(conf.Namespace("auth")); err != nil {
 		return nil, err
+	}
+
+	traceMapping, err := conf.FieldString("extract_tracing_mapping")
+	if err != nil {
+		return nil, err
+	}
+
+	if traceMapping != "" {
+		if n.traceMapping, err = conf.FieldBloblang("extract_tracing_mapping"); err != nil {
+			return nil, err
+		}
 	}
 
 	return &n, nil
@@ -230,6 +250,38 @@ func (n *natsReader) Read(ctx context.Context) (*service.Message, service.AckFun
 			value := msg.Header.Get(key)
 			bmsg.MetaSetMut(key, value)
 		}
+	}
+
+	if n.traceMapping != nil {
+		spanPart, err := bmsg.BloblangQuery(n.traceMapping)
+		if err != nil {
+			n.log.Errorf("Mapping failed for tracing span: %v", err)
+			return nil, nil, err
+		}
+
+		structured, err := spanPart.AsStructured()
+		if err != nil {
+			n.log.Errorf("Mapping failed for tracing span: %v", err)
+			return nil, nil, err
+		}
+
+		spanMap, ok := structured.(map[string]any)
+		if !ok {
+			n.log.Errorf("Mapping failed for tracing span, expected an object, got: %T", structured)
+			return nil, nil, err
+		}
+
+		c := propagation.MapCarrier{}
+		for k, v := range spanMap {
+			if vStr, ok := v.(string); ok {
+				c[strings.ToLower(k)] = vStr
+			}
+		}
+
+		textProp := otel.GetTextMapPropagator()
+		ctx := textProp.Extract(bmsg.Context(), c)
+		pCtx, _ := n.tracerProvider.Tracer("benthos").Start(ctx, "input_nats")
+		bmsg = bmsg.WithContext(pCtx)
 	}
 
 	return bmsg, func(_ context.Context, res error) error {
