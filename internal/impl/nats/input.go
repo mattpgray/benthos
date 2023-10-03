@@ -150,13 +150,13 @@ func newNATSReader(conf *service.ParsedConfig, mgr *service.Resources) (*natsRea
 		return nil, err
 	}
 
-	traceMapping, err := conf.FieldString("extract_tracing_mapping")
+	traceMapping, err := conf.FieldString("extract_tracing_map")
 	if err != nil {
 		return nil, err
 	}
 
 	if traceMapping != "" {
-		if n.traceMapping, err = conf.FieldBloblang("extract_tracing_mapping"); err != nil {
+		if n.traceMapping, err = conf.FieldBloblang("extract_tracing_map"); err != nil {
 			return nil, err
 		}
 	}
